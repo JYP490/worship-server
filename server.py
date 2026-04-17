@@ -82,14 +82,19 @@ def separate_audio(input_path, output_dir):
         print("Demucs 음원 분리 중...", flush=True)
         result = subprocess.run(
             ["python3", "-m", "demucs",
-             "--two-stems", "vocals",   # 보컬 + 반주 2트랙만
+             "--two-stems", "vocals",
              "--out", output_dir,
              "--mp3",
              input_path],
             capture_output=True, text=True, timeout=300
         )
+        print(f"Demucs returncode: {result.returncode}", flush=True)
+        if result.stderr:
+            print(f"Demucs stderr: {result.stderr[:500]}", flush=True)
+        if result.stdout:
+            print(f"Demucs stdout: {result.stdout[:200]}", flush=True)
         if result.returncode != 0:
-            print(f"Demucs 오류: {result.stderr}", flush=True)
+            print(f"Demucs 실패!", flush=True)
             return None, None
 
         # 출력 파일 찾기
@@ -333,7 +338,14 @@ def transcribe():
         if len(starts) > 4:
             ivs = [starts[i+1]-starts[i] for i in range(min(20,len(starts)-1))
                    if 0.1 < starts[i+1]-starts[i] < 2.0]
-            if ivs: bpm = round(60/(sum(ivs)/len(ivs)))
+            if ivs:
+                raw_bpm = round(60/(sum(ivs)/len(ivs)))
+                # 찬양곡은 보통 60~100BPM
+                # 너무 빠르면 절반으로 보정
+                if raw_bpm > 120:
+                    bpm = round(raw_bpm / 2)
+                else:
+                    bpm = raw_bpm
 
         # ── 7. Whisper 가사 인식 (보컬 트랙만) ────
         print("Whisper 가사 인식 중...", flush=True)
