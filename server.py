@@ -78,16 +78,19 @@ def transcribe():
         file.save(tmp.name)
         tmp_path = tmp.name
     try:
-        model_output, midi_data, note_events = predict(
-            tmp_path,
-            ICASSP_2022_MODEL_PATH,
-            onset_threshold    = 0.5,
-            frame_threshold    = 0.3,
-            minimum_note_length= 58,
-            minimum_frequency  = 65.4,
-            maximum_frequency  = 2093,
-            midi_tempo         = 120,
-        )
+        import sys
+print("분석 시작...", flush=True)
+model_output, midi_data, note_events = predict(
+    tmp_path,
+    ICASSP_2022_MODEL_PATH,
+    onset_threshold    = 0.5,
+    frame_threshold    = 0.3,
+    minimum_note_length= 58,
+    minimum_frequency  = 65.4,
+    maximum_frequency  = 2093,
+    midi_tempo         = 120,
+)
+print(f"분석 완료! 음표 수: {len(note_events)}", flush=True)
         notes_result = []
         note_count   = [0] * 12
         for note in note_events:
@@ -132,8 +135,10 @@ def transcribe():
             "chords": [c["chord"] for c in chords_result],
             "chordsWithTime": chords_result,
         })
-    except Exception as e:
-        return jsonify({"error": "분석 실패: " + str(e)}), 500
+except Exception as e:
+    import traceback
+    print("오류 발생:", traceback.format_exc(), flush=True)
+    return jsonify({"error": "분석 실패: " + str(e)}), 500
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
