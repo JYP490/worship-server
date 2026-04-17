@@ -1,7 +1,10 @@
 import os
 import tempfile
+import shutil
+import subprocess
 import numpy as np
 from flask import Flask, request, jsonify
+from pathlib import Path
 
 os.environ["BASIC_PITCH_MODEL"] = "onnx"
 
@@ -73,6 +76,40 @@ def extract_melody(note_events, max_notes=64):
         t += 0.25
     return melody[:max_notes]
 
+def separate_audio(input_path, output_dir):
+    """Demucs로 보컬/반주 분리"""
+    try:
+        print("Demucs 음원 분리 중...", flush=True)
+        result = subprocess.run(
+            ["python3", "-m", "demucs",
+             "--two-stems", "vocals",   # 보컬 + 반주 2트랙만
+             "--out", output_dir,
+             "--mp3",
+             input_path],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            print(f"Demucs 오류: {result.stderr}", flush=True)
+            return None, None
+
+        # 출력 파일 찾기
+        out = Path(output_dir)
+        vocal_files   = list(out.rglob("vocals.mp3"))
+        no_vocal_files= list(out.rglob("no_vocals.mp3"))
+
+        vocal_path    = str(vocal_files[0])   if vocal_files    else None
+        no_vocal_path = str(no_vocal_files[0]) if no_vocal_files else None
+
+        print(f"분리 완료! 보컬: {vocal_path}", flush=True)
+        return vocal_path, no_vocal_path
+
+    except subprocess.TimeoutExpired:
+        print("Demucs 타임아웃", flush=True)
+        return None, None
+    except Exception as e:
+        print(f"Demucs 예외: {e}", flush=True)
+        return None, None
+
 def detect_sections(note_events, lyrics_segments, total_duration):
     window    = 2.0
     n_windows = int(total_duration / window) + 1
@@ -109,11 +146,11 @@ def detect_sections(note_events, lyrics_segments, total_duration):
     for i in range(n_windows):
         e     = energy[i]
         vocal = i in vocal_windows or vocal_prob[i] > 0.4
-        if e < low_thresh * 0.1:      labels.append("silence")
-        elif vocal:                    labels.append("vocal")
-        elif e < low_thresh:          labels.append("silence")
-        elif e > high_thresh:         labels.append("climax")
-        else:                          labels.append("instrumental")
+        if e < low_thresh * 0.1:     labels.append("silence")
+        elif vocal:                   labels.append("vocal")
+        elif e < low_thresh:         labels.append("silence")
+        elif e > high_thresh:        labels.append("climax")
+        else:                         labels.append("instrumental")
 
     raw = []
     if labels:
@@ -144,17 +181,17 @@ def detect_sections(note_events, lyrics_segments, total_duration):
             name, display = "climax", "클라이맥스"
         else:
             instr_count += 1
-            if is_first:                              name, display = "intro",        "인트로"
-            elif is_last:                             name, display = "outro",        "아웃트로"
-            elif prev_label in ["vocal", "climax"]:  name, display = "interlude",    "간주"
-            else:                                     name, display = f"instrumental{instr_count}", "악기 솔로"
+            if is_first:                             name, display = "intro",     "인트로"
+            elif is_last:                            name, display = "outro",     "아웃트로"
+            elif prev_label in ["vocal","climax"]:   name, display = "interlude", "간주"
+            else:                                    name, display = f"instrumental{instr_count}", "악기 솔로"
 
-        # 구간 코드
         section_chords = []
         t2, prev_chord = s, None
         while t2 < e:
             active = [int(n[2]) for n in note_events
-                      if float(n[0]) <= t2+0.5 and float(n[1]) >= t2 and s <= float(n[0]) <= e]
+                      if float(n[0]) <= t2+0.5 and float(n[1]) >= t2
+                      and s <= float(n[0]) <= e]
             chord = notes_to_chord(active)
             if chord and chord != prev_chord:
                 section_chords.append(chord)
@@ -163,14 +200,11 @@ def detect_sections(note_events, lyrics_segments, total_duration):
 
         unique_chords = list(dict.fromkeys(section_chords))[:8]
         result.append({
-            "name"    : name,
-            "display" : display,
-            "start"   : round(s, 1),
-            "end"     : round(e, 1),
-            "duration": round(e - s, 1),
-            "label"   : label,
-            "chords"  : unique_chords,
-            "hasVocal": label in ["vocal", "climax"],
+            "name": name, "display": display,
+            "start": round(s, 1), "end": round(e, 1),
+            "duration": round(e-s, 1), "label": label,
+            "chords": unique_chords,
+            "hasVocal": label in ["vocal","climax"],
         })
         prev_label = label
 
@@ -188,11 +222,11 @@ def quantize_notes(note_events, bpm):
                   if float(n[0]) <= t+beat_dur*0.5 and float(n[1]) >= t
                   and (float(n[3]) if len(n) > 3 else 1.0) > 0.4]
         if active:
-            top   = max(active, key=lambda n: int(n[2]))
-            midi  = int(top[2])
+            top  = max(active, key=lambda n: int(n[2]))
+            midi = int(top[2])
             name, octave = midi_to_note(midi)
             dur   = float(top[1]) - float(top[0])
-            beats = max(0.5, min(4.0, round(dur / beat_dur * 2) / 2))
+            beats = max(0.5, min(4.0, round(dur/beat_dur*2)/2))
             if name != prev_name:
                 quantized.append({
                     "pitch": name, "octave": octave, "beats": beats,
@@ -200,7 +234,8 @@ def quantize_notes(note_events, bpm):
                 })
                 prev_name = name
         else:
-            quantized.append({"pitch":"r","octave":4,"beats":1.0,"duration":"q","isRest":True,"midi":0})
+            quantized.append({"pitch":"r","octave":4,"beats":1.0,
+                              "duration":"q","isRest":True,"midi":0})
         t += beat_dur
     return quantized[:128]
 
@@ -215,7 +250,8 @@ def beats_to_dur(beats):
 
 def chords_at_beats(chords_result, bpm):
     beat_dur = 60.0 / bpm if bpm > 0 else 0.5
-    return [{"chord": c["chord"], "beat": round(c["time"] / beat_dur, 1)} for c in chords_result]
+    return [{"chord": c["chord"], "beat": round(c["time"]/beat_dur, 1)}
+            for c in chords_result]
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -229,16 +265,28 @@ def transcribe():
     if not file or not allowed_file(file.filename):
         return jsonify({"error": "MP3, WAV, M4A, AAC만 가능해요"}), 400
 
-    suffix = '.' + file.filename.rsplit('.', 1)[1].lower()
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        file.save(tmp.name)
-        tmp_path = tmp.name
+    suffix  = '.' + file.filename.rsplit('.', 1)[1].lower()
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path= os.path.join(tmp_dir, "input" + suffix)
+    file.save(tmp_path)
+
+    vocal_path    = None
+    no_vocal_path = None
 
     try:
-        # ── 1. Basic Pitch 채보 ─────────────────────
-        print("Basic Pitch 분석 중...", flush=True)
+        # ── 1. Demucs 음원 분리 ────────────────────
+        sep_dir = os.path.join(tmp_dir, "separated")
+        os.makedirs(sep_dir, exist_ok=True)
+        vocal_path, no_vocal_path = separate_audio(tmp_path, sep_dir)
+
+        # 분리 실패 시 원본 사용
+        chord_source = no_vocal_path if no_vocal_path else tmp_path
+        vocal_source = vocal_path    if vocal_path    else tmp_path
+
+        # ── 2. 반주 트랙으로 코드 분석 ────────────
+        print("Basic Pitch 코드 분석 중...", flush=True)
         _, _, note_events = predict(
-            tmp_path, ICASSP_2022_MODEL_PATH,
+            chord_source, ICASSP_2022_MODEL_PATH,
             onset_threshold=0.5, frame_threshold=0.3,
             minimum_note_length=58,
             minimum_frequency=65.4, maximum_frequency=2093,
@@ -247,16 +295,26 @@ def transcribe():
         print(f"음표 수: {len(note_events)}", flush=True)
         total_duration = max((float(n[1]) for n in note_events), default=0)
 
-        # ── 2. 멜로디 추출 ─────────────────────────
-        melody_notes = extract_melody(note_events)
+        # ── 3. 보컬 트랙으로 멜로디 감지 ──────────
+        print("보컬 트랙 멜로디 분석 중...", flush=True)
+        _, _, vocal_events = predict(
+            vocal_source, ICASSP_2022_MODEL_PATH,
+            onset_threshold=0.6, frame_threshold=0.4,
+            minimum_note_length=80,
+            minimum_frequency=130.0, maximum_frequency=1200.0,
+            midi_tempo=120,
+        )
+        melody_notes = extract_melody(vocal_events)
+        print(f"멜로디 음표: {len(melody_notes)}", flush=True)
 
-        # ── 3. 조성 + 코드 ─────────────────────────
+        # ── 4. 조성 감지 ───────────────────────────
         note_count = [0] * 12
         for n in note_events:
             note_count[int(n[2]) % 12] += 1
         detected_key, mode = detect_key(note_count)
         key_display = detected_key + ("" if mode == "major" else "m")
 
+        # ── 5. 코드 진행 ───────────────────────────
         chords_result = []
         prev_chord = None
         t = 0.0
@@ -269,7 +327,7 @@ def transcribe():
                 prev_chord = chord
             t += 0.5
 
-        # ── 4. BPM 추정 ────────────────────────────
+        # ── 6. BPM 추정 ────────────────────────────
         starts = sorted([float(n[0]) for n in note_events])
         bpm = 0
         if len(starts) > 4:
@@ -277,21 +335,20 @@ def transcribe():
                    if 0.1 < starts[i+1]-starts[i] < 2.0]
             if ivs: bpm = round(60/(sum(ivs)/len(ivs)))
 
-        # ── 5. Whisper 가사 인식 ───────────────────
+        # ── 7. Whisper 가사 인식 (보컬 트랙만) ────
         print("Whisper 가사 인식 중...", flush=True)
         lyrics_segments = []
         full_lyrics     = ""
         detected_lang   = "unknown"
         try:
             segments_gen, info = whisper_model.transcribe(
-                tmp_path,
+                vocal_source,
                 language=None,
                 task="transcribe",
                 beam_size=5,
             )
-            detected_lang  = info.language
-            segments_list  = list(segments_gen)
-            for seg in segments_list:
+            detected_lang = info.language
+            for seg in list(segments_gen):
                 text = seg.text.strip()
                 if text:
                     lyrics_segments.append({
@@ -300,16 +357,16 @@ def transcribe():
                         "end"  : round(seg.end,   2),
                     })
             full_lyrics = "\n".join(s["text"] for s in lyrics_segments)
-            print(f"가사 완료! 언어:{detected_lang} 세그먼트:{len(lyrics_segments)}", flush=True)
+            print(f"가사 완료! 언어:{detected_lang} {len(lyrics_segments)}개", flush=True)
         except Exception as e:
             print(f"Whisper 오류: {e}", flush=True)
 
-        # ── 6. 구간 감지 ────────────────────────────
+        # ── 8. 구간 감지 ────────────────────────────
         print("구간 감지 중...", flush=True)
         sections = detect_sections(note_events, lyrics_segments, total_duration)
         print(f"구간: {[s['display'] for s in sections]}", flush=True)
 
-        # ── 7. 가사 + 코드 매핑 ────────────────────
+        # ── 9. 가사 + 코드 매핑 ────────────────────
         lyrics_with_chords = []
         for seg in lyrics_segments:
             seg_chords = []
@@ -324,11 +381,12 @@ def transcribe():
                 "end"   : seg["end"],
             })
 
-        # ── 8. 정량화 음표 ─────────────────────────
-        quantized_notes = quantize_notes(note_events, bpm) if bpm > 0 else []
+        # ── 10. 정량화 음표 ────────────────────────
+        quantized_notes = quantize_notes(vocal_events, bpm) if bpm > 0 else []
         chord_beats     = chords_at_beats(chords_result, bpm) if bpm > 0 else []
 
-        print(f"완료! Key:{key_display} BPM:{bpm} 구간:{len(sections)}개", flush=True)
+        used_demucs = vocal_path is not None
+        print(f"완료! Key:{key_display} BPM:{bpm} Demucs:{used_demucs}", flush=True)
 
         return jsonify({
             "success"        : True,
@@ -337,6 +395,7 @@ def transcribe():
             "bpm"            : bpm,
             "language"       : detected_lang,
             "duration"       : round(total_duration, 1),
+            "usedDemucs"     : used_demucs,
             "noteCount"      : len(melody_notes),
             "chordCount"     : len(chords_result),
             "notes"          : melody_notes,
@@ -356,8 +415,7 @@ def transcribe():
         return jsonify({"error": "분석 실패: " + str(e)}), 500
 
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
