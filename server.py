@@ -1,7 +1,4 @@
-import os
-import tempfile
-import shutil
-import subprocess
+import os, tempfile, shutil, subprocess
 import numpy as np
 from pathlib import Path
 from flask import Flask, request, jsonify
@@ -19,221 +16,196 @@ def allowed_file(f):
     return '.' in f and f.rsplit('.', 1)[1].lower() in ALLOWED
 
 # ══════════════════════════════════════════════════
-# 1. librosa chroma 코드 감지
+# 조성 감지 (전체 오디오 chroma 기반)
 # ══════════════════════════════════════════════════
-def detect_chords_chroma(audio_path, sr=22050):
+def detect_key(audio_path):
     import librosa
-    y, sr  = librosa.load(audio_path, sr=sr, mono=True)
-    y_harm, _ = librosa.effects.hpss(y)
-    hop    = 4096
-    chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=hop, bins_per_octave=36)
+    y, sr    = librosa.load(audio_path, sr=22050, mono=True)
+    y_harm,_ = librosa.effects.hpss(y)
+    profile  = librosa.feature.chroma_cqt(
+        y=y_harm, sr=sr, hop_length=2048
+    ).mean(axis=1)
 
+    major_tmpl = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88]
+    minor_tmpl = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17]
+    best_key, best_mode, best_corr = "C", "major", -999
+
+    for i in range(12):
+        for tmpl, mode in [(major_tmpl,"major"),(minor_tmpl,"minor")]:
+            corr = float(np.corrcoef(profile, np.roll(tmpl, i))[0,1])
+            if corr > best_corr:
+                best_corr, best_key, best_mode = corr, NOTES[i], mode
+
+    return best_key, best_mode
+
+# ══════════════════════════════════════════════════
+# 키 제한 코드 감지 (핵심 정확도 향상)
+# ══════════════════════════════════════════════════
+def get_scale_roots(key_note, mode):
+    """해당 키의 스케일 음 인덱스 반환"""
+    major_steps = [0,2,4,5,7,9,11]
+    minor_steps = [0,2,3,5,7,8,10]
+    steps = major_steps if mode == "major" else minor_steps
+    root  = NOTES.index(key_note)
+    return [(root + s) % 12 for s in steps]
+
+def scale_chord_quality(degree_idx, mode):
+    """스케일 음급별 기본 화음 성질"""
+    major_q = ["","m","m","","","m","dim"]
+    minor_q = ["m","dim","","m","m","",""]
+    return (major_q if mode == "major" else minor_q)[degree_idx]
+
+def detect_chords(audio_path, key_note, mode, sr=22050):
+    """
+    키 스케일 안의 코드만 허용 → 정확도 대폭 향상
+    F장조면 F,Gm,Am,Bb,C,Dm만 감지
+    """
+    import librosa
+
+    y, sr    = librosa.load(audio_path, sr=sr, mono=True)
+    y_harm,_ = librosa.effects.hpss(y)
+    chroma   = librosa.feature.chroma_cqt(
+        y=y_harm, sr=sr, hop_length=2048, bins_per_octave=36
+    )
+
+    duration    = librosa.get_duration(y=y, sr=sr)
+    frames      = chroma.shape[1]
+    secs_fr     = duration / frames
+    win         = max(1, int(2.0 / secs_fr))
+
+    scale_roots = get_scale_roots(key_note, mode)
+    key_idx     = NOTES.index(key_note)
+
+    # 코드 템플릿 (예배에서 자주 쓰는 것만)
     templates = {
         ""    : [1,0,0,0,1,0,0,1,0,0,0,0],
         "m"   : [1,0,0,1,0,0,0,1,0,0,0,0],
         "7"   : [1,0,0,0,1,0,0,1,0,0,1,0],
-        "M7"  : [1,0,0,0,1,0,0,1,0,0,0,1],
         "m7"  : [1,0,0,1,0,0,0,1,0,0,1,0],
         "sus4": [1,0,0,0,0,1,0,1,0,0,0,0],
-        "sus2": [1,0,1,0,0,0,0,1,0,0,0,0],
     }
 
-    duration    = librosa.get_duration(y=y, sr=sr)
-    frames      = chroma.shape[1]
-    secs_per_fr = duration / frames
-    win_frames  = max(1, int(2.0 / secs_per_fr))
-
     result, prev = [], None
-    for i in range(0, frames, win_frames):
-        chunk = chroma[:, i:i+win_frames].mean(axis=1)
-        best_score, best_chord = -1, "C"
-        for root_idx in range(12):
-            rotated = np.roll(chunk, -root_idx)
+    for i in range(0, frames, win):
+        chunk = chroma[:, i:i+win].mean(axis=1)
+        best_score, best_chord = -1, NOTES[key_idx]
+
+        for degree, root_idx in enumerate(scale_roots):
+            rotated  = np.roll(chunk, -root_idx)
+            expected = scale_chord_quality(degree, mode)
             for suffix, tmpl in templates.items():
-                score = np.dot(rotated, tmpl)
+                score = float(np.dot(rotated, tmpl))
+                if suffix == expected:
+                    score *= 1.2  # 기대 화음에 보너스
                 if score > best_score:
                     best_score = score
                     best_chord = NOTES[root_idx] + suffix
-        time = i * secs_per_fr
+
+        t = round(i * secs_fr, 2)
         if best_chord != prev:
-            result.append({"chord": best_chord, "time": round(time, 2)})
+            result.append({"chord": best_chord, "time": t})
             prev = best_chord
 
-    return result, duration
+    return result, round(duration, 1)
 
 # ══════════════════════════════════════════════════
-# 2. pyin 멜로디 + 보이스 감지
+# pyin 멜로디 + voiced 타임라인
 # ══════════════════════════════════════════════════
-def detect_melody_pyin(audio_path, sr=22050):
+def detect_melody(audio_path, sr=22050):
     import librosa
-    y, sr  = librosa.load(audio_path, sr=sr, mono=True)
-    hop    = 512
-    f0, voiced_flag, _ = librosa.pyin(
-        y,
-        fmin=librosa.note_to_hz('C3'),
-        fmax=librosa.note_to_hz('C6'),
-        sr=sr, hop_length=hop,
+    y, sr   = librosa.load(audio_path, sr=sr, mono=True)
+    hop     = 512
+    f0, voiced, _ = librosa.pyin(
+        y, fmin=librosa.note_to_hz('C3'),
+        fmax=librosa.note_to_hz('C6'), sr=sr, hop_length=hop
     )
-    times        = librosa.times_like(f0, sr=sr, hop_length=hop)
-    melody_notes = []
-    prev_name    = None
+    times   = librosa.times_like(f0, sr=sr, hop_length=hop)
+    notes, prev = [], None
 
-    for i, (freq, voiced) in enumerate(zip(f0, voiced_flag)):
-        if not voiced or freq is None or np.isnan(freq): continue
-        midi_int = int(round(librosa.hz_to_midi(freq)))
-        name     = NOTES[midi_int % 12]
-        octave   = (midi_int // 12) - 1
-        time     = float(times[i])
-        if name != prev_name:
-            melody_notes.append({
-                "name": name, "octave": octave, "midi": midi_int,
-                "start": round(time, 3), "end": round(time + 0.25, 3),
-                "isSharp": "#" in name, "displayName": name + str(octave),
+    for i, (freq, v) in enumerate(zip(f0, voiced)):
+        if not v or freq is None or np.isnan(freq): continue
+        midi = int(round(librosa.hz_to_midi(freq)))
+        name = NOTES[midi % 12]
+        if name != prev:
+            notes.append({
+                "name": name, "octave": (midi//12)-1, "midi": midi,
+                "start": round(float(times[i]), 3),
+                "end":   round(float(times[i])+0.25, 3),
+                "isSharp": "#" in name,
+                "displayName": name + str((midi//12)-1),
             })
-            prev_name = name
+            prev = name
 
-    # voiced_flag 타임라인 반환 (멘트 감지용)
-    voiced_timeline = [(float(times[i]), bool(voiced_flag[i]))
-                       for i in range(len(times))]
-    return melody_notes[:64], voiced_timeline
+    voiced_timeline = [(float(times[i]), bool(voiced[i])) for i in range(len(times))]
+    return notes[:64], voiced_timeline
 
 # ══════════════════════════════════════════════════
-# 3. 멘트 vs 가사 구분
-# ══════════════════════════════════════════════════
-def classify_segments(lyrics_segments, voiced_timeline):
-    """
-    각 가사 세그먼트가 '노래(가사)'인지 '말(멘트)'인지 구분
-    voiced_flag 비율로 판단:
-      voiced 비율 > 55% → 가사 (노래)
-      voiced 비율 <= 55% → 멘트 (선포/말)
-    """
-    result = []
-    for seg in lyrics_segments:
-        start, end = seg["start"], seg["end"]
-
-        # 이 구간의 voiced 프레임 비율 계산
-        frames_in_seg = [(t, v) for t, v in voiced_timeline if start <= t <= end]
-        if not frames_in_seg:
-            voiced_ratio = 0.0
-        else:
-            voiced_ratio = sum(1 for _, v in frames_in_seg if v) / len(frames_in_seg)
-
-        # 분류
-        if voiced_ratio > 0.55:
-            seg_type = "lyrics"   # 노래 (가사)
-        elif voiced_ratio > 0.15:
-            seg_type = "spoken"   # 멘트 (선포)
-        else:
-            seg_type = "silence"  # 무음
-
-        result.append({
-            "text"        : seg["text"].strip(),
-            "start"       : seg["start"],
-            "end"         : seg["end"],
-            "type"        : seg_type,
-            "voicedRatio" : round(voiced_ratio, 2),
-        })
-
-    return result
-
-# ══════════════════════════════════════════════════
-# 4. BPM 감지
+# BPM 감지
 # ══════════════════════════════════════════════════
 def detect_bpm(audio_path, sr=22050):
     import librosa
-    y, sr  = librosa.load(audio_path, sr=sr, mono=True, duration=60)
+    y, sr  = librosa.load(audio_path, sr=sr, mono=True, duration=90)
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    bpm    = round(float(tempo))
-    while bpm > 110: bpm = round(bpm / 2)
-    while bpm < 50:  bpm = round(bpm * 2)
+    bpm = round(float(tempo))
+    # 찬양 BPM 보정 (55~110)
+    while bpm > 120: bpm = round(bpm / 2)
+    while bpm < 55:  bpm = round(bpm * 2)
     return bpm
 
 # ══════════════════════════════════════════════════
-# 5. 조성 감지
+# 멘트 vs 가사 분류
 # ══════════════════════════════════════════════════
-def detect_key_from_chords(chords_result):
-    major = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88]
-    minor = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17]
-    counts = [0.0] * 12
-    for c in chords_result:
-        ch   = c["chord"]
-        root = ch[:2] if len(ch) > 1 and ch[1] == "#" else ch[:1]
-        if root in NOTES:
-            counts[NOTES.index(root)] += 1.0
-    best_key, best_mode, best_corr = "C", "major", -999
-    for i in range(12):
-        cm = float(np.corrcoef(counts, major[i:]+major[:i])[0,1])
-        if cm > best_corr: best_corr, best_key, best_mode = cm, NOTES[i], "major"
-        cn = float(np.corrcoef(counts, minor[i:]+minor[:i])[0,1])
-        if cn > best_corr: best_corr, best_key, best_mode = cn, NOTES[i], "minor"
-    return best_key, best_mode
+def classify_segments(raw_segs, voiced_timeline):
+    result = []
+    for seg in raw_segs:
+        s, e = seg["start"], seg["end"]
+        frames = [(t, v) for t, v in voiced_timeline if s <= t <= e]
+        ratio  = sum(1 for _, v in frames if v) / max(1, len(frames))
+        seg_type = "lyrics" if ratio > 0.5 else ("spoken" if ratio > 0.1 else "silence")
+        result.append({
+            "text": seg["text"].strip(),
+            "start": s, "end": e,
+            "type": seg_type, "voicedRatio": round(ratio, 2),
+        })
+    return result
 
 # ══════════════════════════════════════════════════
-# 6. Demucs 음원 분리
+# 구간 감지
 # ══════════════════════════════════════════════════
-def separate_audio(input_path, output_dir):
-    try:
-        print("Demucs 음원 분리 중...", flush=True)
-        result = subprocess.run(
-            ["python3", "-m", "demucs", "--two-stems", "vocals",
-             "--out", output_dir, "--mp3", input_path],
-            capture_output=True, text=True, timeout=300
-        )
-        print(f"Demucs returncode: {result.returncode}", flush=True)
-        if result.stderr: print(f"Demucs stderr: {result.stderr[:300]}", flush=True)
-        if result.returncode != 0: return None, None
-
-        out            = Path(output_dir)
-        vocal_path     = str(list(out.rglob("vocals.mp3"))[0])    if list(out.rglob("vocals.mp3"))    else None
-        no_vocal_path  = str(list(out.rglob("no_vocals.mp3"))[0]) if list(out.rglob("no_vocals.mp3")) else None
-        print(f"분리 완료! 보컬:{vocal_path is not None}", flush=True)
-        return vocal_path, no_vocal_path
-    except Exception as e:
-        print(f"Demucs 오류: {e}", flush=True)
-        return None, None
-
-# ══════════════════════════════════════════════════
-# 7. 구간 감지
-# ══════════════════════════════════════════════════
-def detect_sections(chords_result, classified_segments, total_duration):
+def detect_sections(chords, classified, total):
     vocal_times = set()
-    for seg in classified_segments:
+    for seg in classified:
         if seg["type"] == "lyrics":
             t = seg["start"]
             while t < seg["end"]:
-                vocal_times.add(int(t))
-                t += 1.0
+                vocal_times.add(int(t)); t += 1.0
 
-    window = 8.0
-    sections = []
-    prev_label = None
+    window = 16.0
+    sections, prev_label = [], None
     vocal_count = instr_count = 0
     t = 0.0
 
-    while t < total_duration:
-        end      = min(t + window, total_duration)
+    while t < total:
+        end      = min(t + window, total)
         is_vocal = any(int(x) in vocal_times for x in np.arange(t, end, 1.0))
-
-        seg_chords = []
-        for c in chords_result:
-            if t <= c["time"] < end:
-                if not seg_chords or seg_chords[-1] != c["chord"]:
-                    seg_chords.append(c["chord"])
+        seg_chords = list(dict.fromkeys(
+            c["chord"] for c in chords if t <= c["time"] < end
+        ))[:6]
 
         if is_vocal:
             vocal_count += 1
-            if vocal_count == 1:   name, display = "verse1",  "1절"
-            elif vocal_count == 2: name, display = "chorus",  "후렴"
-            elif vocal_count == 3: name, display = "verse2",  "2절"
-            elif vocal_count == 4: name, display = "chorus2", "후렴 반복"
-            else:                  name, display = f"section{vocal_count}", f"섹션{vocal_count}"
+            label_map = {1:"verse1",2:"chorus",3:"verse2",4:"chorus2"}
+            name    = label_map.get(vocal_count, f"section{vocal_count}")
+            display_map = {1:"1절",2:"후렴",3:"2절",4:"후렴 반복"}
+            display = display_map.get(vocal_count, f"섹션{vocal_count}")
         else:
             instr_count += 1
-            if t < 10:                               name, display = "intro",      "인트로"
-            elif end >= total_duration - 10:         name, display = "outro",      "아웃트로"
-            elif prev_label == "vocal":              name, display = "interlude",  "간주"
-            else:                                    name, display = "bridge",     "브릿지"
+            if t < 8:                        name, display = "intro",     "인트로"
+            elif end >= total - 8:           name, display = "outro",     "아웃트로"
+            elif prev_label == "vocal":      name, display = "interlude", "간주"
+            else:                            name, display = "bridge",    "브릿지"
 
+        lbl = "vocal" if is_vocal else "instrumental"
         if sections and sections[-1]["name"] == name:
             sections[-1]["end"]      = round(end, 1)
             sections[-1]["duration"] = round(end - sections[-1]["start"], 1)
@@ -241,197 +213,225 @@ def detect_sections(chords_result, classified_segments, total_duration):
         else:
             sections.append({
                 "name": name, "display": display,
-                "start": round(t, 1), "end": round(end, 1),
-                "duration": round(end - t, 1),
-                "label": "vocal" if is_vocal else "instrumental",
-                "chords": list(dict.fromkeys(seg_chords))[:8],
-                "hasVocal": is_vocal,
+                "start": round(t,1), "end": round(end,1),
+                "duration": round(end-t,1), "label": lbl,
+                "chords": seg_chords, "hasVocal": is_vocal,
             })
-            prev_label = "vocal" if is_vocal else "instrumental"
+            prev_label = lbl
         t += window
 
     return sections
 
 # ══════════════════════════════════════════════════
-# 8. 정량화
+# Demucs 음원 분리
 # ══════════════════════════════════════════════════
-def quantize_notes(melody_notes, bpm):
-    if not melody_notes or bpm <= 0: return []
-    beat_dur = 60.0 / bpm
-    result   = []
-    for n in melody_notes:
-        dur   = n["end"] - n["start"]
-        beats = max(0.5, min(4.0, round(dur / beat_dur * 2) / 2))
-        result.append({
-            "pitch": n["name"], "octave": n["octave"], "beats": beats,
-            "duration": beats_to_dur(beats), "isRest": False, "midi": n["midi"],
-        })
-    return result[:128]
+def convert_to_wav(input_path, out_dir):
+    import librosa, soundfile as sf
+    wav  = os.path.join(out_dir, "input.wav")
+    y, sr = librosa.load(input_path, sr=44100, mono=False)
+    if y.ndim == 1: y = np.stack([y, y])
+    sf.write(wav, y.T, sr)
+    return wav
 
-def beats_to_dur(b):
-    if b >= 4: return "w"
-    if b >= 3: return "hd"
-    if b >= 2: return "h"
-    if b >= 1.5: return "qd"
-    if b >= 1: return "q"
-    return "8"
+def separate_audio(input_path, out_dir):
+    try:
+        print("Demucs 시작...", flush=True)
+        wav = convert_to_wav(input_path, out_dir)
+        res = subprocess.run(
+            ["python3", "-m", "demucs", "--two-stems", "vocals",
+             "--out", out_dir, wav],
+            capture_output=True, text=True, timeout=300
+        )
+        print(f"Demucs returncode: {res.returncode}", flush=True)
+        if res.stderr: print(f"Demucs: {res.stderr[:200]}", flush=True)
+        if res.returncode != 0: return None, None
 
-def chords_at_beats(chords_result, bpm):
-    beat_dur = 60.0 / bpm if bpm > 0 else 0.5
-    return [{"chord": c["chord"], "beat": round(c["time"] / beat_dur, 1)} for c in chords_result]
+        out = Path(out_dir)
+        voc = list(out.rglob("vocals.wav"))
+        nov = list(out.rglob("no_vocals.wav"))
+        return (str(voc[0]) if voc else None), (str(nov[0]) if nov else None)
+    except Exception as e:
+        print(f"Demucs 오류: {e}", flush=True)
+        return None, None
 
 # ══════════════════════════════════════════════════
-# API
+# 핵심 분석 파이프라인
 # ══════════════════════════════════════════════════
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "ok", "message": "WorshipSheet 서버 정상 작동 중"})
-
-@app.route('/transcribe', methods=['POST'])
-def transcribe():
-    if 'file' not in request.files:
-        return jsonify({"error": "파일이 없어요"}), 400
-    file = request.files['file']
-    if not file or not allowed_file(file.filename):
-        return jsonify({"error": "MP3, WAV, M4A, AAC만 가능해요"}), 400
-
-    suffix   = '.' + file.filename.rsplit('.', 1)[1].lower()
-    tmp_dir  = tempfile.mkdtemp()
-    tmp_path = os.path.join(tmp_dir, "input" + suffix)
-    file.save(tmp_path)
-
+def process_audio(audio_path, tmp_dir, hint_title="", hint_artist=""):
     try:
         # Demucs 분리
-        sep_dir = os.path.join(tmp_dir, "separated")
+        sep_dir = os.path.join(tmp_dir, "sep")
         os.makedirs(sep_dir, exist_ok=True)
-        vocal_path, no_vocal_path = separate_audio(tmp_path, sep_dir)
-        used_demucs   = vocal_path is not None
-        chord_source  = no_vocal_path if no_vocal_path else tmp_path
-        vocal_source  = vocal_path    if vocal_path    else tmp_path
+        vocal_path, instr_path = separate_audio(audio_path, sep_dir)
+        used_demucs  = vocal_path is not None
+        chord_src    = instr_path if instr_path else audio_path
+        vocal_src    = vocal_path if vocal_path  else audio_path
 
-        # 1. 코드
-        print("코드 감지 중...", flush=True)
-        chords_result, total_duration = detect_chords_chroma(chord_source)
-        print(f"코드 {len(chords_result)}개", flush=True)
-
-        # 2. 멜로디 + voiced timeline
-        print("멜로디 감지 중...", flush=True)
-        melody_notes, voiced_timeline = detect_melody_pyin(vocal_source)
-        print(f"멜로디 {len(melody_notes)}개", flush=True)
-
-        # 3. BPM
-        bpm = detect_bpm(tmp_path)
-        print(f"BPM: {bpm}", flush=True)
-
-        # 4. 조성
-        detected_key, mode = detect_key_from_chords(chords_result)
-        key_display = detected_key + ("" if mode == "major" else "m")
+        # 1. 조성 (가장 먼저!)
+        print("조성 감지...", flush=True)
+        key_note, mode = detect_key(chord_src)
+        key_display    = key_note + ("" if mode == "major" else "m")
         print(f"조성: {key_display}", flush=True)
 
-        # 5. Whisper 가사 인식
-        print("Whisper 가사 인식 중...", flush=True)
-        raw_segments  = []
-        detected_lang = "unknown"
+        # 2. 코드 (키 제한으로 정확도 향상)
+        print("코드 감지 (키 제한)...", flush=True)
+        chords, total_dur = detect_chords(chord_src, key_note, mode)
+        print(f"코드 {len(chords)}개", flush=True)
+
+        # 3. 멜로디
+        print("멜로디 감지...", flush=True)
+        melody, voiced_tl = detect_melody(vocal_src)
+        print(f"멜로디 {len(melody)}개", flush=True)
+
+        # 4. BPM
+        bpm = detect_bpm(audio_path)
+        print(f"BPM: {bpm}", flush=True)
+
+        # 5. 가사
+        print("가사 인식 (Whisper medium)...", flush=True)
+        raw_segs, lang = [], "ko"
         try:
-            segments_gen, info = whisper_model.transcribe(
-                vocal_source,
-                language="ko",
-                task="transcribe",
+            segs_gen, info = whisper_model.transcribe(
+                vocal_src, language="ko", task="transcribe",
                 beam_size=5,
-                initial_prompt="찬양 예배 하나님 주님 예수 그리스도 할렐루야",
+                initial_prompt="찬양 예배 하나님 주님 예수님 그리스도 성령 할렐루야",
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
+                vad_parameters=dict(min_silence_duration_ms=800, speech_pad_ms=300),
+                temperature=0, no_speech_threshold=0.35,
             )
-            detected_lang = info.language
-            for seg in list(segments_gen):
-                text = seg.text.strip()
-                if text and len(text) > 1:
-                    raw_segments.append({
-                        "text" : text,
-                        "start": round(seg.start, 2),
-                        "end"  : round(seg.end,   2),
-                    })
-            print(f"가사 {len(raw_segments)}개 세그먼트", flush=True)
+            lang = info.language
+            for s in list(segs_gen):
+                if s.text.strip() and len(s.text.strip()) > 1:
+                    raw_segs.append({"text":s.text.strip(),"start":round(s.start,2),"end":round(s.end,2)})
+            print(f"가사 {len(raw_segs)}개", flush=True)
         except Exception as e:
             print(f"Whisper 오류: {e}", flush=True)
 
-        # 6. 멘트 vs 가사 분류
-        classified = classify_segments(raw_segments, voiced_timeline)
+        # 6. 멘트/가사 분류
+        classified   = classify_segments(raw_segs, voiced_tl)
+        lyrics_segs  = [s for s in classified if s["type"] == "lyrics"]
+        spoken_segs  = [s for s in classified if s["type"] == "spoken"]
+        full_lyrics  = "\n".join(s["text"] for s in lyrics_segs)
+        print(f"가사:{len(lyrics_segs)}개 멘트:{len(spoken_segs)}개", flush=True)
 
-        # 가사만 추출
-        lyrics_only = [s for s in classified if s["type"] == "lyrics"]
-        spoken_only = [s for s in classified if s["type"] == "spoken"]
-        full_lyrics = "\n".join(s["text"] for s in lyrics_only)
-
-        print(f"가사: {len(lyrics_only)}개 / 멘트: {len(spoken_only)}개", flush=True)
-
-        # 7. 구간 감지
-        sections = detect_sections(chords_result, classified, total_duration)
+        # 7. 구간
+        sections = detect_sections(chords, classified, total_dur)
         print(f"구간: {[s['display'] for s in sections]}", flush=True)
 
         # 8. 가사+코드 매핑
         lyrics_with_chords = []
-        for seg in lyrics_only:
-            seg_chords = []
-            for c in chords_result:
-                if seg["start"] <= c["time"] <= seg["end"]:
-                    if not seg_chords or seg_chords[-1] != c["chord"]:
-                        seg_chords.append(c["chord"])
+        for seg in lyrics_segs:
+            seg_chords = list(dict.fromkeys(
+                c["chord"] for c in chords if seg["start"] <= c["time"] <= seg["end"]
+            ))
             lyrics_with_chords.append({
-                "text": seg["text"], "chords": seg_chords,
-                "start": seg["start"], "end": seg["end"],
+                "text":seg["text"], "chords":seg_chords,
+                "start":seg["start"], "end":seg["end"],
             })
 
-        # 멘트+코드 매핑
         spoken_with_chords = []
-        for seg in spoken_only:
-            seg_chords = []
-            for c in chords_result:
-                if seg["start"] <= c["time"] <= seg["end"]:
-                    if not seg_chords or seg_chords[-1] != c["chord"]:
-                        seg_chords.append(c["chord"])
+        for seg in spoken_segs:
+            seg_chords = list(dict.fromkeys(
+                c["chord"] for c in chords if seg["start"] <= c["time"] <= seg["end"]
+            ))
             spoken_with_chords.append({
-                "text": seg["text"], "chords": seg_chords,
-                "start": seg["start"], "end": seg["end"],
+                "text":seg["text"], "chords":seg_chords,
+                "start":seg["start"], "end":seg["end"],
             })
-
-        # 9. 정량화
-        quantized_notes = quantize_notes(melody_notes, bpm)
-        chord_beats     = chords_at_beats(chords_result, bpm)
 
         print(f"완료! Key:{key_display} BPM:{bpm} Demucs:{used_demucs}", flush=True)
 
         return jsonify({
-            "success"          : True,
-            "key"              : key_display,
-            "mode"             : mode,
-            "bpm"              : bpm,
-            "language"         : detected_lang,
-            "duration"         : round(total_duration, 1),
-            "usedDemucs"       : used_demucs,
-            "noteCount"        : len(melody_notes),
-            "chordCount"       : len(chords_result),
-            "notes"            : melody_notes,
-            "chords"           : [c["chord"] for c in chords_result],
-            "chordsWithTime"   : chords_result,
-            "lyrics"           : full_lyrics,
-            "lyricsSegments"   : lyrics_with_chords,
-            "spokenSegments"   : spoken_with_chords,
-            "allSegments"      : classified,
-            "sections"         : sections,
-            "quantizedNotes"   : quantized_notes,
-            "chordBeats"       : chord_beats,
-            "timeSignature"    : "4/4",
+            "success"        : True,
+            "key"            : key_display,
+            "mode"           : mode,
+            "bpm"            : bpm,
+            "language"       : lang,
+            "duration"       : total_dur,
+            "usedDemucs"     : used_demucs,
+            "chords"         : [c["chord"] for c in chords],
+            "chordsWithTime" : chords,
+            "lyrics"         : full_lyrics,
+            "lyricsSegments" : lyrics_with_chords,
+            "spokenSegments" : spoken_with_chords,
+            "sections"       : sections,
+            "notes"          : melody,
+            "songTitle"      : hint_title,
+            "songArtist"     : hint_artist,
         })
 
     except Exception as e:
         import traceback
         print("오류:", traceback.format_exc(), flush=True)
-        return jsonify({"error": "분석 실패: " + str(e)}), 500
+        return jsonify({"error": str(e)}), 500
+
+# ══════════════════════════════════════════════════
+# API 엔드포인트
+# ══════════════════════════════════════════════════
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"})
+
+@app.route('/transcribe_url', methods=['POST'])
+def transcribe_url():
+    """YouTube URL 채보 (메인 엔드포인트)"""
+    data = request.get_json()
+    if not data or 'url' not in data:
+        return jsonify({"error": "URL이 없어요"}), 400
+
+    url = data['url'].strip()
+    if 'youtube.com' not in url and 'youtu.be' not in url:
+        return jsonify({"error": "유튜브 URL만 지원해요"}), 400
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        import yt_dlp
+        print(f"유튜브 다운로드: {url}", flush=True)
+
+        ydl_opts = {
+            'format'        : 'bestaudio/best',
+            'outtmpl'       : os.path.join(tmp_dir, 'audio.%(ext)s'),
+            'postprocessors': [{'key':'FFmpegExtractAudio',
+                                'preferredcodec':'mp3','preferredquality':'192'}],
+            'quiet': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title  = info.get('title', '')
+            artist = info.get('uploader', '')
+
+        mp3s = [f for f in os.listdir(tmp_dir) if f.endswith('.mp3')]
+        if not mp3s:
+            return jsonify({"error": "다운로드 실패"}), 500
+
+        audio_path = os.path.join(tmp_dir, mp3s[0])
+        print(f"다운로드 완료: {title}", flush=True)
+        return process_audio(audio_path, tmp_dir, title, artist)
+
+    except Exception as e:
+        import traceback
+        print("YouTube 오류:", traceback.format_exc(), flush=True)
+        return jsonify({"error": str(e)}), 500
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+@app.route('/transcribe', methods=['POST'])
+def transcribe():
+    """파일 업로드 채보 (보조)"""
+    if 'file' not in request.files:
+        return jsonify({"error": "파일 없음"}), 400
+    file = request.files['file']
+    if not allowed_file(file.filename):
+        return jsonify({"error": "지원하지 않는 형식"}), 400
+
+    tmp_dir  = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, "input." + file.filename.rsplit('.',1)[1].lower())
+    file.save(tmp_path)
+    try:
+        return process_audio(tmp_path, tmp_dir)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
