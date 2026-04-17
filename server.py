@@ -5,6 +5,8 @@ import numpy as np
 from flask import Flask, request, jsonify
 from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
+import os
+os.environ["BASIC_PITCH_MODEL"] = "onnx"
 
 app = Flask(__name__)
 
