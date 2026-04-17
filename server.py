@@ -435,3 +435,134 @@ def transcribe():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
+# ══════════════════════════════════════════════════
+# 악보 이미지 분석 (Claude Vision API)
+# ══════════════════════════════════════════════════
+@app.route('/analyze_sheet', methods=['POST'])
+def analyze_sheet():
+    """
+    악보 이미지(JPG/PNG/PDF)를 Claude Vision으로 분석해서
+    코드/가사/키/박자를 추출
+    """
+    if 'file' not in request.files:
+        return jsonify({"error": "파일이 없어요"}), 400
+
+    file     = request.files['file']
+    filename = file.filename.lower()
+
+    try:
+        import anthropic, base64
+
+        api_key = os.environ.get('ANTHROPIC_API_KEY')
+        if not api_key:
+            return jsonify({"error": "ANTHROPIC_API_KEY가 설정되지 않았어요"}), 500
+
+        client = anthropic.Anthropic(api_key=api_key)
+
+        # PDF → 첫 페이지만 이미지로 변환
+        if filename.endswith('.pdf'):
+            import io
+            pdf_bytes = file.read()
+            # PDF를 이미지로 변환 (pypdf + Pillow)
+            try:
+                from pypdf import PdfReader
+                from PIL import Image
+                import io as _io
+
+                reader = PdfReader(_io.BytesIO(pdf_bytes))
+                # PDF를 PNG로 렌더링 (간단한 방법)
+                # pypdf는 렌더링 미지원 → base64로 직접 전송
+                img_data    = base64.b64encode(pdf_bytes).decode('utf-8')
+                media_type  = "application/pdf"
+            except:
+                img_data   = base64.b64encode(pdf_bytes).decode('utf-8')
+                media_type = "application/pdf"
+        else:
+            img_bytes  = file.read()
+            img_data   = base64.b64encode(img_bytes).decode('utf-8')
+            if filename.endswith('.png'):
+                media_type = "image/png"
+            elif filename.endswith('.jpg') or filename.endswith('.jpeg'):
+                media_type = "image/jpeg"
+            else:
+                media_type = "image/jpeg"
+
+        print("Claude Vision으로 악보 분석 중...", flush=True)
+
+        # Claude에게 악보 분석 요청
+        prompt = """이 악보 이미지를 분석해서 아래 JSON 형식으로만 응답해주세요.
+다른 설명 없이 JSON만 출력하세요.
+
+{
+  "key": "F",
+  "timeSignature": "4/4",
+  "bpm": 76,
+  "chords": ["F", "Bb", "C", "Gm", "Dm"],
+  "chordsInOrder": ["F", "C", "Bb", "F", "Gm", "C", "F"],
+  "lyrics": "줄별 가사 전체",
+  "lyricsLines": ["1번 줄 가사", "2번 줄 가사"],
+  "sections": [
+    {"name": "인트로", "chords": ["F", "C", "Bb"]},
+    {"name": "1절", "chords": ["F", "Bb", "C", "Gm"]},
+    {"name": "후렴", "chords": ["Bb", "F", "C", "Dm"]}
+  ],
+  "title": "곡 제목 (있으면)",
+  "artist": "아티스트 (있으면)"
+}
+
+악보에서 읽을 수 없는 항목은 null로 처리하세요.
+코드는 정확히 악보에 표시된 그대로 추출하세요 (예: F/A, Bb, Gm7 등)."""
+
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=2000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": img_data,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ],
+            }]
+        )
+
+        raw = response.content[0].text.strip()
+        print(f"Claude 응답: {raw[:200]}", flush=True)
+
+        # JSON 파싱
+        import json, re
+        # 마크다운 코드블록 제거
+        raw = re.sub(r'```json\s*', '', raw)
+        raw = re.sub(r'```\s*', '', raw)
+        result = json.loads(raw)
+
+        print(f"악보 분석 완료! Key:{result.get('key')} 코드:{len(result.get('chords',[]))}개", flush=True)
+
+        return jsonify({
+            "success"       : True,
+            "key"           : result.get("key"),
+            "timeSignature" : result.get("timeSignature"),
+            "bpm"           : result.get("bpm"),
+            "chords"        : result.get("chords", []),
+            "chordsInOrder" : result.get("chordsInOrder", []),
+            "lyrics"        : result.get("lyrics"),
+            "lyricsLines"   : result.get("lyricsLines", []),
+            "sections"      : result.get("sections", []),
+            "title"         : result.get("title"),
+            "artist"        : result.get("artist"),
+        })
+
+    except Exception as e:
+        import traceback
+        print("악보 분석 오류:", traceback.format_exc(), flush=True)
+        return jsonify({"error": str(e)}), 500
