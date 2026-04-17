@@ -382,8 +382,9 @@ def transcribe():
             })
 
         # ── 10. 정량화 음표 ────────────────────────
-        quantized_notes = quantize_notes(vocal_events, bpm) if bpm > 0 else []
-        chord_beats     = chords_at_beats(chords_result, bpm) if bpm > 0 else []
+        effective_bpm   = bpm if bpm > 0 else 80  # BPM 감지 실패시 기본 80
+        quantized_notes = quantize_notes(vocal_events, effective_bpm)
+        chord_beats     = chords_at_beats(chords_result, effective_bpm)
 
         used_demucs = vocal_path is not None
         print(f"완료! Key:{key_display} BPM:{bpm} Demucs:{used_demucs}", flush=True)
