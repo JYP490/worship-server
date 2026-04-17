@@ -389,7 +389,7 @@ def transcribe_url():
         print(f"유튜브 다운로드: {url}", flush=True)
 
         ydl_opts = {
-            'format'        : 'bestaudio/best',
+            'format'        : 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
             'outtmpl'       : os.path.join(tmp_dir, 'audio.%(ext)s'),
             'postprocessors': [{'key':'FFmpegExtractAudio',
                                 'preferredcodec':'mp3','preferredquality':'192'}],
@@ -400,11 +400,14 @@ def transcribe_url():
             title  = info.get('title', '')
             artist = info.get('uploader', '')
 
-        mp3s = [f for f in os.listdir(tmp_dir) if f.endswith('.mp3')]
-        if not mp3s:
-            return jsonify({"error": "다운로드 실패"}), 500
+        # mp3 또는 다른 오디오 포맷 찾기
+        audio_exts = ('.mp3', '.m4a', '.webm', '.ogg', '.opus', '.wav')
+        audio_files = [f for f in os.listdir(tmp_dir)
+                       if f.lower().endswith(audio_exts)]
+        if not audio_files:
+            return jsonify({"error": "다운로드 실패 - 오디오 파일 없음"}), 500
 
-        audio_path = os.path.join(tmp_dir, mp3s[0])
+        audio_path = os.path.join(tmp_dir, audio_files[0])
         print(f"다운로드 완료: {title}", flush=True)
         return process_audio(audio_path, tmp_dir, title, artist)
 
