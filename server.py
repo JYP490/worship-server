@@ -9,11 +9,10 @@ from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
 import whisper
 
-app      = Flask(__name__)
-ALLOWED  = {'mp3', 'wav', 'm4a', 'aac', 'ogg'}
-NOTES    = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+app     = Flask(__name__)
+ALLOWED = {'mp3', 'wav', 'm4a', 'aac', 'ogg'}
+NOTES   = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
 
-# Whisper 모델 미리 로드 (small = 한국어 지원, 메모리 적게 사용)
 print("Whisper 모델 로딩 중...", flush=True)
 whisper_model = whisper.load_model("small")
 print("Whisper 모델 로딩 완료!", flush=True)
@@ -37,9 +36,9 @@ def detect_key(note_counts):
 
 def notes_to_chord(active):
     if not active: return None
-    idx   = sorted(set(n % 12 for n in active))
-    root  = NOTES[idx[0]]
-    ivs   = [(i - idx[0]) % 12 for i in idx[1:]]
+    idx  = sorted(set(n % 12 for n in active))
+    root = NOTES[idx[0]]
+    ivs  = [(i - idx[0]) % 12 for i in idx[1:]]
     if 4 in ivs and 7 in ivs and 11 in ivs: return root + "M7"
     if 3 in ivs and 7 in ivs and 10 in ivs: return root + "m7"
     if 4 in ivs and 7 in ivs and 10 in ivs: return root + "7"
@@ -51,42 +50,193 @@ def notes_to_chord(active):
     if 2 in ivs and 7 in ivs:               return root + "sus2"
     return root
 
-def extract_melody(note_events):
-    """각 시간 구간에서 가장 높고 자신감 있는 음만 추출 (멜로디)"""
-    melody = []
-    window = 0.25  # 250ms 단위
-    if not note_events: return melody
-
-    max_time = max(float(n[1]) for n in note_events)
+def extract_melody(note_events, max_notes=64):
+    """신뢰도 높은 최고음만 추출 (멜로디)"""
+    melody, prev = [], None
+    max_time = max((float(n[1]) for n in note_events), default=0)
     t = 0.0
-    prev_note = None
-
     while t < max_time:
-        # 이 구간에 울리는 음표들 중 신뢰도 높은 것만
-        active = [
-            n for n in note_events
-            if float(n[0]) <= t + window and float(n[1]) >= t
-            and (float(n[3]) if len(n) > 3 else 1.0) > 0.5
-        ]
+        active = [n for n in note_events
+                  if float(n[0]) <= t+0.25 and float(n[1]) >= t
+                  and (float(n[3]) if len(n) > 3 else 1.0) > 0.5]
         if active:
-            # 가장 높은 음 (멜로디는 보통 최고음)
             top = max(active, key=lambda n: int(n[2]))
-            midi  = int(top[0+2])
-            note_name, octave = midi_to_note(midi)
-            if note_name != prev_note:
+            midi = int(top[2])
+            name, octave = midi_to_note(midi)
+            if name != prev:
                 melody.append({
-                    "name"       : note_name,
-                    "octave"     : octave,
-                    "midi"       : midi,
-                    "start"      : round(t, 3),
-                    "end"        : round(float(top[1]), 3),
-                    "isSharp"    : "#" in note_name,
-                    "displayName": note_name + str(octave)
+                    "name": name, "octave": octave, "midi": midi,
+                    "start": round(t, 3), "end": round(float(top[1]), 3),
+                    "isSharp": "#" in name, "displayName": name + str(octave)
                 })
-                prev_note = note_name
-        t += window
+                prev = name
+        t += 0.25
+    return melody[:max_notes]
 
-    return melody[:64]  # 최대 64음표
+def detect_sections(note_events, lyrics_segments, total_duration):
+    """
+    구간 자동 감지:
+    - 에너지(음표 밀도) 분석
+    - 보컬 여부 (Whisper 결과)
+    - 음역대 분석 (높은음=보컬, 낮은음=악기)
+    """
+    window   = 2.0   # 2초 단위로 분석
+    sections = []
+
+    # 2초 단위 에너지 계산
+    n_windows = int(total_duration / window) + 1
+    energy    = [0.0] * n_windows
+    vocal_prob= [0.0] * n_windows  # 보컬 가능성 (높은음 비율)
+
+    for note in note_events:
+        start = float(note[0])
+        midi  = int(note[2])
+        conf  = float(note[3]) if len(note) > 3 else 1.0
+        idx   = int(start / window)
+        if idx < n_windows:
+            energy[idx]    += conf
+            # 보컬 음역대: C4(60) ~ C6(84)
+            if 60 <= midi <= 84:
+                vocal_prob[idx] += conf
+
+    # 보컬 가능성 정규화
+    for i in range(n_windows):
+        if energy[i] > 0:
+            vocal_prob[i] /= energy[i]
+
+    # Whisper 가사 구간에서 보컬 여부 확인
+    vocal_windows = set()
+    for seg in lyrics_segments:
+        if len(seg.get("text","").strip()) > 2:  # 실제 가사가 있으면
+            start_idx = int(seg["start"] / window)
+            end_idx   = int(seg["end"]   / window) + 1
+            for i in range(start_idx, min(end_idx, n_windows)):
+                vocal_windows.add(i)
+
+    # 에너지 임계값
+    avg_energy = sum(energy) / max(1, len([e for e in energy if e > 0]))
+    low_thresh = avg_energy * 0.3
+    high_thresh= avg_energy * 1.2
+
+    # 구간 레이블 결정
+    labels = []
+    for i in range(n_windows):
+        t     = i * window
+        e     = energy[i]
+        vocal = i in vocal_windows or vocal_prob[i] > 0.4
+
+        if e < low_thresh * 0.1:
+            labels.append("silence")
+        elif vocal:
+            labels.append("vocal")
+        elif e < low_thresh:
+            labels.append("silence")
+        elif e > high_thresh:
+            labels.append("climax")
+        else:
+            labels.append("instrumental")
+
+    # 연속 구간 병합 + 섹션 이름 부여
+    raw_sections = []
+    if labels:
+        cur_label = labels[0]
+        cur_start = 0
+        for i in range(1, len(labels)):
+            if labels[i] != cur_label:
+                raw_sections.append((cur_start * window, i * window, cur_label))
+                cur_label = labels[i]
+                cur_start = i
+        raw_sections.append((cur_start * window, total_duration, cur_label))
+
+    # silence 제거 및 짧은 구간 병합 (4초 미만)
+    filtered = []
+    for s, e, label in raw_sections:
+        if label == "silence": continue
+        if e - s < 4.0: continue
+        filtered.append((s, e, label))
+
+    # 섹션 이름 자동 부여
+    vocal_count = 0
+    instr_count = 0
+    result      = []
+    prev_label  = None
+
+    for i, (s, e, label) in enumerate(filtered):
+        duration = e - s
+        is_first = (i == 0)
+        is_last  = (i == len(filtered) - 1)
+
+        if label == "vocal":
+            vocal_count += 1
+            if vocal_count == 1:
+                name = "verse1"     # 1절
+                display = "1절"
+            elif vocal_count == 2:
+                name = "chorus"     # 후렴
+                display = "후렴"
+            elif vocal_count == 3:
+                name = "verse2"     # 2절
+                display = "2절"
+            elif vocal_count == 4:
+                name = "chorus2"    # 후렴 반복
+                display = "후렴 (반복)"
+            else:
+                name = f"section{vocal_count}"
+                display = f"섹션 {vocal_count}"
+
+        elif label == "climax":
+            name    = "climax"
+            display = "클라이맥스"
+
+        else:  # instrumental
+            instr_count += 1
+            if is_first:
+                name    = "intro"
+                display = "인트로"
+            elif is_last:
+                name    = "outro"
+                display = "아웃트로"
+            elif prev_label in ["vocal", "climax"]:
+                name    = "interlude"
+                display = "간주"
+            else:
+                name    = f"instrumental{instr_count}"
+                display = "악기 솔로"
+
+        # 이 구간의 코드 찾기
+        section_notes = [
+            int(n[2]) for n in note_events
+            if s <= float(n[0]) <= e
+        ]
+        section_chords = []
+        t2 = s
+        prev_chord = None
+        while t2 < e:
+            active = [int(n[2]) for n in note_events
+                      if float(n[0]) <= t2+0.5 and float(n[1]) >= t2
+                      and s <= float(n[0]) <= e]
+            chord = notes_to_chord(active)
+            if chord and chord != prev_chord:
+                section_chords.append(chord)
+                prev_chord = chord
+            t2 += 0.5
+
+        # 중복 제거 및 핵심 코드만
+        unique_chords = list(dict.fromkeys(section_chords))[:8]
+
+        result.append({
+            "name"    : name,
+            "display" : display,
+            "start"   : round(s, 1),
+            "end"     : round(e, 1),
+            "duration": round(e - s, 1),
+            "label"   : label,
+            "chords"  : unique_chords,
+            "hasVocal": label in ["vocal", "climax"],
+        })
+        prev_label = label
+
+    return result
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -106,8 +256,8 @@ def transcribe():
         tmp_path = tmp.name
 
     try:
-        # ── 1. Basic Pitch 채보 ────────────────────
-        print("Basic Pitch 분석 시작...", flush=True)
+        # ── 1. Basic Pitch ─────────────────────────
+        print("Basic Pitch 분석 중...", flush=True)
         _, _, note_events = predict(
             tmp_path, ICASSP_2022_MODEL_PATH,
             onset_threshold=0.5, frame_threshold=0.3,
@@ -117,11 +267,12 @@ def transcribe():
         )
         print(f"음표 수: {len(note_events)}", flush=True)
 
+        total_duration = max((float(n[1]) for n in note_events), default=0)
+
         # ── 2. 멜로디 추출 ─────────────────────────
         melody_notes = extract_melody(note_events)
-        print(f"멜로디 음표: {len(melody_notes)}", flush=True)
 
-        # ── 3. 코드 감지 ───────────────────────────
+        # ── 3. 조성 + 코드 ─────────────────────────
         note_count = [0] * 12
         for n in note_events:
             note_count[int(n[2]) % 12] += 1
@@ -130,10 +281,9 @@ def transcribe():
         key_display = detected_key + ("" if mode == "major" else "m")
 
         chords_result = []
-        max_time = max((float(n[1]) for n in note_events), default=0)
         prev_chord = None
         t = 0.0
-        while t < max_time:
+        while t < total_duration:
             active = [int(n[2]) for n in note_events
                       if float(n[0]) <= t+0.5 and float(n[1]) >= t]
             chord = notes_to_chord(active)
@@ -142,48 +292,46 @@ def transcribe():
                 prev_chord = chord
             t += 0.5
 
-        # ── 4. BPM 추정 ────────────────────────────
+        # ── 4. BPM ─────────────────────────────────
         starts = sorted([float(n[0]) for n in note_events])
         bpm = 0
         if len(starts) > 4:
             ivs = [starts[i+1]-starts[i] for i in range(min(20,len(starts)-1))
                    if 0.1 < starts[i+1]-starts[i] < 2.0]
-            if ivs: bpm = round(60 / (sum(ivs)/len(ivs)))
+            if ivs: bpm = round(60/(sum(ivs)/len(ivs)))
 
-        # ── 5. Whisper 가사 인식 ───────────────────
-        print("Whisper 가사 인식 시작...", flush=True)
+        # ── 5. Whisper 가사 ─────────────────────────
+        print("Whisper 가사 인식 중...", flush=True)
         lyrics_segments = []
+        full_lyrics     = ""
+        detected_lang   = "unknown"
         try:
-            result = whisper_model.transcribe(
-                tmp_path,
-                language=None,       # 언어 자동 감지 (한국어/영어)
-                task="transcribe",
-                word_timestamps=True,
-                fp16=False,
+            w_result = whisper_model.transcribe(
+                tmp_path, language=None,
+                task="transcribe", fp16=False,
             )
-            detected_lang = result.get("language", "unknown")
-            print(f"감지된 언어: {detected_lang}", flush=True)
-
-            for seg in result.get("segments", []):
-                lyrics_segments.append({
-                    "text" : seg["text"].strip(),
-                    "start": round(seg["start"], 2),
-                    "end"  : round(seg["end"], 2),
-                })
-
+            detected_lang = w_result.get("language", "unknown")
+            for seg in w_result.get("segments", []):
+                text = seg["text"].strip()
+                if text:
+                    lyrics_segments.append({
+                        "text" : text,
+                        "start": round(seg["start"], 2),
+                        "end"  : round(seg["end"],   2),
+                    })
             full_lyrics = "\n".join(s["text"] for s in lyrics_segments)
-            print(f"가사 인식 완료! 세그먼트: {len(lyrics_segments)}개", flush=True)
-
+            print(f"가사 완료! 언어:{detected_lang} 세그먼트:{len(lyrics_segments)}", flush=True)
         except Exception as e:
             print(f"Whisper 오류: {e}", flush=True)
-            full_lyrics = ""
-            detected_lang = "unknown"
 
-        # ── 6. 코드 + 가사 매핑 ───────────────────
-        # 각 가사 세그먼트에 해당하는 코드 찾기
+        # ── 6. 구간 감지 ────────────────────────────
+        print("구간 감지 중...", flush=True)
+        sections = detect_sections(note_events, lyrics_segments, total_duration)
+        print(f"구간: {[s['display'] for s in sections]}", flush=True)
+
+        # ── 7. 가사 + 코드 매핑 ────────────────────
         lyrics_with_chords = []
         for seg in lyrics_segments:
-            # 이 구간의 코드 찾기
             seg_chords = []
             for c in chords_result:
                 if seg["start"] <= c["time"] <= seg["end"]:
@@ -196,21 +344,23 @@ def transcribe():
                 "end"   : seg["end"],
             })
 
-        print(f"완료! Key:{key_display} BPM:{bpm} 코드:{len(chords_result)}", flush=True)
+        print(f"완료! Key:{key_display} BPM:{bpm} 구간:{len(sections)}개", flush=True)
 
         return jsonify({
-            "success"         : True,
-            "key"             : key_display,
-            "mode"            : mode,
-            "bpm"             : bpm,
-            "language"        : detected_lang,
-            "noteCount"       : len(melody_notes),
-            "chordCount"      : len(chords_result),
-            "notes"           : melody_notes,
-            "chords"          : [c["chord"] for c in chords_result],
-            "chordsWithTime"  : chords_result,
-            "lyrics"          : full_lyrics,
-            "lyricsSegments"  : lyrics_with_chords,
+            "success"        : True,
+            "key"            : key_display,
+            "mode"           : mode,
+            "bpm"            : bpm,
+            "language"       : detected_lang,
+            "duration"       : round(total_duration, 1),
+            "noteCount"      : len(melody_notes),
+            "chordCount"     : len(chords_result),
+            "notes"          : melody_notes,
+            "chords"         : [c["chord"] for c in chords_result],
+            "chordsWithTime" : chords_result,
+            "lyrics"         : full_lyrics,
+            "lyricsSegments" : lyrics_with_chords,
+            "sections"       : sections,
         })
 
     except Exception as e:
