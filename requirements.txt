@@ -9,3 +9,4 @@ faster-whisper==1.0.3
 demucs==4.0.1
 soundfile==0.12.1
 anthropic>=0.25.0
+psycopg2-binary==2.9.9
