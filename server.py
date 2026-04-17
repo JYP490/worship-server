@@ -348,3 +348,186 @@ def analyze_sheet():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT',5000)))
+
+# ══════════════════════════════════════════════════
+# PostgreSQL DB 연동
+# ══════════════════════════════════════════════════
+import psycopg2, psycopg2.extras, json as _json
+
+def get_db():
+    return psycopg2.connect(os.environ["DATABASE_URL"], sslmode="require")
+
+def init_db():
+    """테이블 초기화"""
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS songs (
+                id           TEXT PRIMARY KEY,
+                title        TEXT NOT NULL DEFAULT '',
+                artist       TEXT NOT NULL DEFAULT '',
+                youtube_url  TEXT NOT NULL DEFAULT '',
+                key          TEXT NOT NULL DEFAULT 'C',
+                bpm          INT  NOT NULL DEFAULT 0,
+                chords       JSONB NOT NULL DEFAULT '[]',
+                lyrics       TEXT NOT NULL DEFAULT '',
+                is_favorite  BOOLEAN NOT NULL DEFAULT FALSE,
+                sections_json       TEXT NOT NULL DEFAULT '',
+                lyrics_segments_json TEXT NOT NULL DEFAULT '',
+                spoken_json         TEXT NOT NULL DEFAULT '',
+                sheet_music_paths   JSONB NOT NULL DEFAULT '[]',
+                created_at   TIMESTAMP DEFAULT NOW(),
+                updated_at   TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        conn.commit()
+        cur.close(); conn.close()
+        print("DB 초기화 완료!", flush=True)
+    except Exception as e:
+        print(f"DB 초기화 오류: {e}", flush=True)
+
+# 서버 시작 시 DB 초기화
+try:
+    init_db()
+except Exception as e:
+    print(f"DB 연결 실패 (나중에 재시도): {e}", flush=True)
+
+# ── 찬양 CRUD ────────────────────────────────────
+@app.route('/songs', methods=['GET'])
+def get_songs():
+    """전체 찬양 목록"""
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM songs ORDER BY updated_at DESC")
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        return jsonify({"success": True, "songs": [dict(r) for r in rows]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/songs', methods=['POST'])
+def save_song():
+    """찬양 저장 (추가 or 수정)"""
+    data = request.get_json()
+    if not data or 'id' not in data:
+        return jsonify({"error": "id 없음"}), 400
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO songs
+                (id, title, artist, youtube_url, key, bpm, chords,
+                 lyrics, is_favorite, sections_json, lyrics_segments_json,
+                 spoken_json, sheet_music_paths, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                title                = EXCLUDED.title,
+                artist               = EXCLUDED.artist,
+                youtube_url          = EXCLUDED.youtube_url,
+                key                  = EXCLUDED.key,
+                bpm                  = EXCLUDED.bpm,
+                chords               = EXCLUDED.chords,
+                lyrics               = EXCLUDED.lyrics,
+                is_favorite          = EXCLUDED.is_favorite,
+                sections_json        = EXCLUDED.sections_json,
+                lyrics_segments_json = EXCLUDED.lyrics_segments_json,
+                spoken_json          = EXCLUDED.spoken_json,
+                sheet_music_paths    = EXCLUDED.sheet_music_paths,
+                updated_at           = NOW()
+        """, (
+            data['id'],
+            data.get('title', ''),
+            data.get('artist', ''),
+            data.get('youtubeURL', ''),
+            data.get('key', 'C'),
+            data.get('bpm', 0),
+            _json.dumps(data.get('chords', []), ensure_ascii=False),
+            data.get('lyrics', ''),
+            data.get('isFavorite', False),
+            data.get('sectionsJSON', ''),
+            data.get('lyricsSegmentsJSON', ''),
+            data.get('spokenJSON', ''),
+            _json.dumps(data.get('sheetMusicPaths', []), ensure_ascii=False),
+        ))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/songs/<song_id>', methods=['DELETE'])
+def delete_song(song_id):
+    """찬양 삭제"""
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM songs WHERE id = %s", (song_id,))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── 예배 콘티 CRUD ────────────────────────────────
+@app.route('/sets', methods=['GET'])
+def get_sets():
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS worship_sets (
+                id       TEXT PRIMARY KEY,
+                name     TEXT NOT NULL DEFAULT '새 예배',
+                date_str TEXT NOT NULL DEFAULT '',
+                song_ids JSONB NOT NULL DEFAULT '[]',
+                note     TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        conn.commit()
+        cur.execute("SELECT * FROM worship_sets ORDER BY updated_at DESC")
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        return jsonify({"success": True, "sets": [dict(r) for r in rows]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/sets', methods=['POST'])
+def save_set():
+    data = request.get_json()
+    if not data or 'id' not in data:
+        return jsonify({"error": "id 없음"}), 400
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO worship_sets (id, name, date_str, song_ids, note, updated_at)
+            VALUES (%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                name       = EXCLUDED.name,
+                date_str   = EXCLUDED.date_str,
+                song_ids   = EXCLUDED.song_ids,
+                note       = EXCLUDED.note,
+                updated_at = NOW()
+        """, (
+            data['id'],
+            data.get('name', '새 예배'),
+            data.get('dateStr', ''),
+            _json.dumps(data.get('songIDs', []), ensure_ascii=False),
+            data.get('note', ''),
+        ))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/sets/<set_id>', methods=['DELETE'])
+def delete_set(set_id):
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM worship_sets WHERE id = %s", (set_id,))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
