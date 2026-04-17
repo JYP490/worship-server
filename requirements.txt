@@ -7,3 +7,5 @@ gunicorn==21.2.0
 onnxruntime==1.16.3
 scipy==1.11.4
 faster-whisper==1.0.3
+demucs==4.0.1
+ 
