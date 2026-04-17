@@ -344,6 +344,10 @@ def transcribe():
                 "end"   : seg["end"],
             })
 
+        # 박자 정량화
+        quantized_notes = quantize_notes(note_events, bpm) if bpm > 0 else []
+        chord_beats     = chords_at_beats(chords_result, bpm) if bpm > 0 else []
+
         print(f"완료! Key:{key_display} BPM:{bpm} 구간:{len(sections)}개", flush=True)
 
         return jsonify({
@@ -361,6 +365,9 @@ def transcribe():
             "lyrics"         : full_lyrics,
             "lyricsSegments" : lyrics_with_chords,
             "sections"       : sections,
+            "quantizedNotes" : quantized_notes,
+            "chordBeats"     : chord_beats,
+            "timeSignature"  : "4/4",
         })
 
     except Exception as e:
@@ -375,3 +382,69 @@ def transcribe():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
+def quantize_notes(note_events, bpm):
+    """음표를 박자에 맞게 정량화 (타임스탬프 → 음표 길이)"""
+    if not note_events or bpm <= 0:
+        return []
+
+    beat_duration = 60.0 / bpm  # 1박자 = 몇 초
+    quantized     = []
+    prev_name     = None
+
+    # 멜로디만 추출 (최고음, 신뢰도 0.5 이상)
+    sorted_events = sorted(note_events, key=lambda n: float(n[0]))
+    max_time      = max(float(n[1]) for n in note_events)
+
+    t = 0.0
+    while t < max_time:
+        window = beat_duration * 0.5
+        active = [n for n in note_events
+                  if float(n[0]) <= t + window and float(n[1]) >= t
+                  and (float(n[3]) if len(n) > 3 else 1.0) > 0.4]
+
+        if active:
+            top   = max(active, key=lambda n: int(n[2]))
+            midi  = int(top[2])
+            name  = NOTES[midi % 12]
+            oct_  = (midi // 12) - 1
+            dur   = float(top[1]) - float(top[0])
+            beats = max(0.5, min(4.0, round(dur / beat_duration * 2) / 2))
+
+            if name != prev_name:
+                quantized.append({
+                    "pitch"   : name,
+                    "octave"  : oct_,
+                    "beats"   : beats,
+                    "duration": beats_to_dur(beats),
+                    "isRest"  : False,
+                    "midi"    : midi,
+                })
+                prev_name = name
+        else:
+            quantized.append({
+                "pitch": "r", "octave": 4, "beats": 1.0,
+                "duration": "q", "isRest": True, "midi": 0,
+            })
+
+        t += beat_duration
+
+    return quantized[:128]
+
+def beats_to_dur(beats):
+    if beats >= 4:   return "w"
+    if beats >= 3:   return "hd"
+    if beats >= 2:   return "h"
+    if beats >= 1.5: return "qd"
+    if beats >= 1:   return "q"
+    if beats >= 0.5: return "8"
+    return "16"
+
+def chords_at_beats(chords_result, bpm):
+    """코드를 박자 위치로 변환"""
+    beat_dur = 60.0 / bpm if bpm > 0 else 0.5
+    result   = []
+    for c in chords_result:
+        beat = c["time"] / beat_dur
+        result.append({"chord": c["chord"], "beat": round(beat, 1)})
+    return result
